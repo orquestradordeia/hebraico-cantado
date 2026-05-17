@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hebraico Cantado | Protótipo Transcrição + Teleprompter</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      tailwind.config = {
+        theme: {
+          extend: {
+            colors: {
+              gold: '#d4af37',
+              night: '#050505',
+            },
+          },
+        },
+      };
+    </script>
+  </head>
+  <body class="bg-night text-zinc-100 min-h-screen">
+    <main class="mx-auto w-full max-w-md px-4 py-5">
+      <header class="mb-4">
+        <h1 class="text-2xl font-bold text-gold">Hebraico Cantado</h1>
+        <p class="text-sm text-zinc-300">MVP: enviar MP3/URL, transcrever hebraico e exibir teleprompter estilo karaoke.</p>
+      </header>
+
+      <section class="rounded-2xl border border-zinc-800 bg-zinc-900 p-4 space-y-3">
+        <label class="block text-xs uppercase tracking-wider text-zinc-400">Upload do MP3</label>
+        <input id="fileInput" type="file" accept="audio/*" class="block w-full text-sm file:mr-3 file:rounded-md file:border-0 file:bg-gold file:px-3 file:py-2 file:text-black" />
+
+        <label class="block text-xs uppercase tracking-wider text-zinc-400">ou URL (Suno/CDN direto para .mp3/.wav)</label>
+        <div class="flex gap-2">
+          <input id="urlInput" type="url" placeholder="https://...mp3" class="w-full rounded-md border border-zinc-700 bg-black/40 px-3 py-2 text-sm" />
+          <button id="loadUrlBtn" class="rounded-md bg-gold px-3 py-2 text-sm font-semibold text-black">Carregar</button>
+        </div>
+
+        <audio id="audio" controls class="w-full"></audio>
+
+        <div class="grid grid-cols-2 gap-2">
+          <button id="transcribeBtn" class="rounded-md border border-gold bg-gold/10 px-3 py-2 text-sm font-semibold text-gold">Transcrever hebraico</button>
+          <button id="startPromptBtn" class="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm font-semibold">Iniciar teleprompter</button>
+        </div>
+
+        <p id="status" class="text-xs text-zinc-400">Status: pronto.</p>
+      </section>
+
+      <section class="mt-4 rounded-2xl border border-zinc-800 bg-zinc-900 p-4">
+        <div class="mb-2 flex items-center justify-between">
+          <h2 class="text-sm font-semibold text-gold">Transcrição / Letra</h2>
+          <button id="useManualBtn" class="text-xs underline text-zinc-300">Usar texto manual</button>
+        </div>
+        <textarea id="manualLyrics" rows="4" dir="rtl" placeholder="Cole aqui o hebraico (fallback manual)" class="mb-3 w-full rounded-md border border-zinc-700 bg-black/40 p-2 text-sm"></textarea>
+
+        <div id="teleprompter" class="relative h-72 overflow-hidden rounded-xl border border-zinc-700 bg-black/50 p-3">
+          <div id="lyricsTrack" class="absolute left-0 right-0 top-24 space-y-6 px-2 transition-transform duration-700"></div>
+          <div class="pointer-events-none absolute inset-x-0 top-28 h-10 rounded-md border border-gold/70 bg-gold/10"></div>
+        </div>
+      </section>
+    </main>
+
+    <script type="module">
+      import { pipeline } from 'https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2';
+
+      const fileInput = document.getElementById('fileInput');
+      const urlInput = document.getElementById('urlInput');
+      const loadUrlBtn = document.getElementById('loadUrlBtn');
+      const audio = document.getElementById('audio');
+      const transcribeBtn = document.getElementById('transcribeBtn');
+      const startPromptBtn = document.getElementById('startPromptBtn');
+      const statusEl = document.getElementById('status');
+      const teleprompter = document.getElementById('teleprompter');
+      const lyricsTrack = document.getElementById('lyricsTrack');
+      const manualLyrics = document.getElementById('manualLyrics');
+      const useManualBtn = document.getElementById('useManualBtn');
+
+      let currentLines = [];
+      let lineTimes = [];
+      let transcriber = null;
+
+      const setStatus = (msg) => (statusEl.textContent = `Status: ${msg}`);
+
+      fileInput.addEventListener('change', () => {
+        const file = fileInput.files?.[0];
+        if (!file) return;
+        audio.src = URL.createObjectURL(file);
+        setStatus('arquivo carregado.');
+      });
+
+      loadUrlBtn.addEventListener('click', () => {
+        if (!urlInput.value) return;
+        audio.src = urlInput.value.trim();
+        audio.load();
+        setStatus('URL carregada.');
+      });
+
+      function renderLines(lines) {
+        lyricsTrack.innerHTML = '';
+        lines.forEach((line, idx) => {
+          const p = document.createElement('p');
+          p.dataset.index = idx;
+          p.dir = 'rtl';
+          p.className = 'text-center text-2xl leading-relaxed text-zinc-400 font-semibold';
+          p.textContent = line;
+          lyricsTrack.appendChild(p);
+        });
+      }
+
+      function chunkHebrew(text) {
+        const words = text.split(/\s+/).filter(Boolean);
+        const chunks = [];
+        for (let i = 0; i < words.length; i += 5) chunks.push(words.slice(i, i + 5).join(' '));
+        return chunks;
+      }
+
+      function buildTiming(lines, duration) {
+        const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : lines.length * 3;
+        const step = safeDuration / Math.max(lines.length, 1);
+        return lines.map((_, i) => i * step);
+      }
+
+      function highlightByTime(t) {
+        if (!lineTimes.length) return;
+        let idx = lineTimes.findIndex((start, i) => t >= start && (i === lineTimes.length - 1 || t < lineTimes[i + 1]));
+        if (idx < 0) idx = lineTimes.length - 1;
+
+        [...lyricsTrack.children].forEach((el, i) => {
+          el.classList.toggle('text-gold', i === idx);
+          el.classList.toggle('text-zinc-100', i === idx);
+          el.classList.toggle('scale-105', i === idx);
+          if (i !== idx) {
+            el.classList.remove('text-gold', 'text-zinc-100', 'scale-105');
+            el.classList.add('text-zinc-400');
+          }
+        });
+
+        const target = lyricsTrack.children[idx];
+        if (target) {
+          const offset = target.offsetTop - 96;
+          lyricsTrack.style.transform = `translateY(${-offset}px)`;
+        }
+      }
+
+      audio.addEventListener('timeupdate', () => highlightByTime(audio.currentTime));
+
+      useManualBtn.addEventListener('click', () => {
+        if (!manualLyrics.value.trim()) return;
+        currentLines = chunkHebrew(manualLyrics.value.trim());
+        lineTimes = buildTiming(currentLines, audio.duration || currentLines.length * 3);
+        renderLines(currentLines);
+        setStatus('texto manual aplicado.');
+      });
+
+      startPromptBtn.addEventListener('click', () => {
+        if (!audio.src) return setStatus('carregue áudio primeiro.');
+        if (!currentLines.length && manualLyrics.value.trim()) {
+          currentLines = chunkHebrew(manualLyrics.value.trim());
+          lineTimes = buildTiming(currentLines, audio.duration || currentLines.length * 3);
+          renderLines(currentLines);
+        }
+        if (!currentLines.length) return setStatus('sem transcrição/lyrics ainda.');
+        audio.play();
+      });
+
+      transcribeBtn.addEventListener('click', async () => {
+        try {
+          if (!audio.src) return setStatus('carregue um áudio antes de transcrever.');
+          setStatus('carregando modelo Whisper (primeira vez pode demorar)...');
+          if (!transcriber) {
+            transcriber = await pipeline('automatic-speech-recognition', 'Xenova/whisper-tiny');
+          }
+
+          setStatus('baixando áudio para transcrição...');
+          const res = await fetch(audio.src);
+          const blob = await res.blob();
+          const buffer = await blob.arrayBuffer();
+          const ctx = new (window.AudioContext || window.webkitAudioContext)();
+          const decoded = await ctx.decodeAudioData(buffer.slice(0));
+          const mono = decoded.numberOfChannels > 1
+            ? decoded.getChannelData(0)
+            : decoded.getChannelData(0);
+
+          setStatus('transcrevendo hebraico...');
+          const result = await transcriber(mono, {
+            language: 'he',
+            task: 'transcribe',
+            chunk_length_s: 25,
+            stride_length_s: 5,
+          });
+
+          const text = result.text?.trim();
+          if (!text) throw new Error('sem texto retornado');
+
+          manualLyrics.value = text;
+          currentLines = chunkHebrew(text);
+          lineTimes = buildTiming(currentLines, audio.duration || currentLines.length * 3);
+          renderLines(currentLines);
+          setStatus('transcrição concluída. revise e corrija se necessário.');
+        } catch (err) {
+          console.error(err);
+          setStatus('falha na transcrição automática. use texto manual como fallback.');
+        }
+      });
+
+      renderLines(['טען אודיו ואז לחץ על תמלול', 'או הדבק טקסט ידני כדי להתחיל']);
+    </script>
+  </body>
+</html>
